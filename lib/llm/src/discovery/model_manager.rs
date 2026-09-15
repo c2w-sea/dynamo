@@ -2549,6 +2549,22 @@ impl ModelManager {
         configs.get(&worker_id)?.disaggregated_endpoint.clone()
     }
 
+    /// Whether a specific worker explicitly advertises a runtime capability.
+    pub fn worker_supports_runtime_capability(
+        &self,
+        endpoint_id: &EndpointId,
+        worker_id: WorkerId,
+        capability: &str,
+    ) -> bool {
+        let Some(rx) = self.runtime_configs.get(endpoint_id) else {
+            return false;
+        };
+        let configs = rx.borrow();
+        configs
+            .get(&worker_id)
+            .is_some_and(|config| config.supports_runtime_capability(capability))
+    }
+
     /// Get the registered `data_parallel_size` for a specific worker.
     /// Used by PD prefill routing so the chosen prefill DP rank can be
     /// encoded into `bootstrap_room` (`bootstrap_room % dp_size == dp_rank`)
@@ -2686,6 +2702,34 @@ mod tests {
     ) {
         let (_tx, rx) = tokio::sync::watch::channel(configs);
         mm.runtime_configs.insert(endpoint_id.clone(), rx);
+    }
+
+    #[test]
+    fn worker_runtime_capability_is_scoped_to_endpoint_and_worker() {
+        let manager = ModelManager::new();
+        let endpoint = EndpointId::from("ns.prefill.generate");
+        let mut supported = ModelRuntimeConfig::default();
+        supported.runtime_data.insert(
+            "prefill_handoff_after_transport_acceptance".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        insert_runtime_configs(&manager, &endpoint, HashMap::from([(7, supported)]));
+
+        assert!(manager.worker_supports_runtime_capability(
+            &endpoint,
+            7,
+            "prefill_handoff_after_transport_acceptance"
+        ));
+        assert!(!manager.worker_supports_runtime_capability(
+            &endpoint,
+            8,
+            "prefill_handoff_after_transport_acceptance"
+        ));
+        assert!(!manager.worker_supports_runtime_capability(
+            &EndpointId::from("other.prefill.generate"),
+            7,
+            "prefill_handoff_after_transport_acceptance"
+        ));
     }
 
     #[tokio::test]

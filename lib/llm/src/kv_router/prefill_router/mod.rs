@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -158,6 +158,7 @@ fn extract_bootstrap_info(params: &serde_json::Value) -> Option<BootstrapInfo> {
 struct PreparedPrefill {
     worker_id: u64,
     bootstrap_info: Option<BootstrapInfo>,
+    wait_for_transport_acceptance: bool,
     topology_constraints: Option<RoutingConstraints>,
 }
 
@@ -176,11 +177,14 @@ enum PrefillCompletion {
     Handoff {
         result: PrefillResult,
         worker_link: Option<TraceLink>,
+        monitor: PrefillMonitor,
     },
     Terminal {
         output: Box<Annotated<LLMEngineOutput>>,
     },
 }
+
+type PrefillMonitor = oneshot::Receiver<Result<(), PrefillError>>;
 
 fn strip_terminal_disaggregated_params(
     mut output: Annotated<LLMEngineOutput>,
@@ -459,19 +463,31 @@ where
 
         let router = &binding.router;
         let endpoint_id = &binding.endpoint_id;
-        let prefill_result: Result<(PrefillOutcome, Option<RoutingConstraints>)> = async {
+        let prefill_result: Result<(
+            PrefillOutcome,
+            Option<RoutingConstraints>,
+            Option<PrefillMonitor>,
+        )> = async {
             let (prepared, prefill_stream) = router
                 .select_and_dispatch_prefill(prefill_context, |request, target| {
                     self.prepare_prefill_dispatch(request, target, endpoint_id)
                 })
                 .await?;
             let topology_constraints = prepared.topology_constraints;
-            let outcome = if let Some(bootstrap_info) = prepared.bootstrap_info {
-                self.spawn_prefill_task(prefill_stream, tracker, prefill_phase_barrier);
-                PrefillOutcome::Bootstrap {
-                    bootstrap_info,
-                    worker_id: prepared.worker_id,
-                }
+            let (outcome, monitor) = if let Some(bootstrap_info) = prepared
+                .bootstrap_info
+                .clone()
+                .filter(|_| !prepared.wait_for_transport_acceptance)
+            {
+                let monitor =
+                    self.spawn_prefill_task(prefill_stream, tracker, prefill_phase_barrier);
+                (
+                    PrefillOutcome::Bootstrap {
+                        bootstrap_info,
+                        worker_id: prepared.worker_id,
+                    },
+                    Some(monitor),
+                )
             } else {
                 drop(prefill_phase_barrier);
                 let completion =
@@ -482,29 +498,38 @@ where
                     PrefillCompletion::Handoff {
                         result,
                         worker_link,
+                        monitor,
                     } => {
                         if let Some(bootstrap_info) =
                             extract_bootstrap_info(&result.disaggregated_params)
                         {
-                            PrefillOutcome::Bootstrap {
-                                bootstrap_info,
-                                worker_id: prepared.worker_id,
-                            }
+                            (
+                                PrefillOutcome::Bootstrap {
+                                    bootstrap_info,
+                                    worker_id: prepared.worker_id,
+                                },
+                                Some(monitor),
+                            )
                         } else {
-                            PrefillOutcome::Completed {
-                                result,
-                                worker_id: prepared.worker_id,
-                                worker_link,
-                            }
+                            (
+                                PrefillOutcome::Completed {
+                                    result,
+                                    worker_id: prepared.worker_id,
+                                    worker_link,
+                                },
+                                None,
+                            )
                         }
                     }
-                    PrefillCompletion::Terminal { output } => PrefillOutcome::Terminal { output },
+                    PrefillCompletion::Terminal { output } => {
+                        (PrefillOutcome::Terminal { output }, None)
+                    }
                 }
             };
-            Ok((outcome, topology_constraints))
+            Ok((outcome, topology_constraints, monitor))
         }
         .await;
-        let (outcome, topology_constraints) = match prefill_result {
+        let (outcome, topology_constraints, prefill_monitor) = match prefill_result {
             Ok(result) => result,
             Err(error) => {
                 use dynamo_runtime::error::{ErrorType, match_error_chain};
@@ -577,7 +602,14 @@ where
             self.conditional_disagg_policy.is_enabled(),
         ));
 
-        next.generate(context.map(|_| decode_req)).await
+        let decode_stream = next.generate(context.map(|_| decode_req)).await?;
+        let Some(prefill_monitor) = prefill_monitor else {
+            return Ok(decode_stream);
+        };
+        Ok(Self::supervise_decode_stream(
+            decode_stream,
+            prefill_monitor,
+        ))
     }
 }
 
@@ -638,6 +670,12 @@ where
                     handoff_id: Some(Uuid::new_v4()),
                 })
             });
+        let wait_for_transport_acceptance = bootstrap_info.is_some()
+            && self.model_manager.worker_supports_runtime_capability(
+                endpoint_id,
+                worker_id,
+                "prefill_handoff_after_transport_acceptance",
+            );
         let routing = request.routing_mut();
         routing.prefill_worker_id = Some(worker_id);
         routing.prefill_dp_rank = dp_rank;
@@ -646,6 +684,7 @@ where
         Ok(PreparedPrefill {
             worker_id,
             bootstrap_info,
+            wait_for_transport_acceptance,
             topology_constraints,
         })
     }

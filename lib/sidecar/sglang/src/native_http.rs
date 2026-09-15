@@ -281,9 +281,9 @@ impl NativeHttp {
                     ));
                     return;
                 };
-                // Publish the handoff only after SGLang accepts the prefill request.
-                // Decode can then rendezvous while this response is drained without
-                // racing a bootstrap room that the backend has not seen yet.
+                // Publish the handoff only after the HTTP transport returns
+                // successful response headers. Decode can then rendezvous while
+                // the remaining prefill response is supervised in the background.
                 yield Ok(LLMEngineOutput {
                     disaggregated_params: Some(handoff),
                     ..Default::default()
@@ -442,7 +442,7 @@ mod tests {
 
     use dynamo_backend_common::engine::RoutingHints;
     use dynamo_backend_common::{
-        BackendError, DisaggregationMode, ErrorType, GenerateContext, OutputOptions,
+        BackendError, DisaggregationMode, ErrorType, FinishReason, GenerateContext, OutputOptions,
         PreprocessedRequest, SamplingOptions, StopConditions,
     };
     use dynamo_sidecar_common::{GrpcEndpoint, HttpEndpoint};
@@ -633,6 +633,76 @@ mod tests {
 
         let error = stream.next().await.unwrap().unwrap_err();
         assert!(error.to_string().contains("HTTP 500"));
+        assert!(stream.next().await.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefill_handoff_waits_for_backend_response_headers() {
+        let body =
+            "data: {\"output_ids\":[101],\"meta_info\":{\"finish_reason\":{\"type\":\"length\"}}}\n\n"
+                .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_headers_tx, release_headers_rx) = tokio::sync::oneshot::channel();
+        let (release_body_tx, release_body_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            request_seen_tx.send(()).unwrap();
+            release_headers_rx.await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            release_body_rx.await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        });
+
+        let ctx = GenerateContext::new(dynamo_backend_common::testing::mock_context(), None);
+        let mut stream = native_http(port).generate(
+            NativeRequest {
+                body: json!({"input_ids": [1], "stream": true}),
+                is_prefill: true,
+                prefill_handoff: Some(json!({
+                    "bootstrap_host": "prefill",
+                    "bootstrap_port": 5000,
+                    "bootstrap_room": 7
+                })),
+            },
+            ctx,
+            CancellationToken::new(),
+        );
+
+        let mut first_output = Box::pin(stream.next());
+        tokio::select! {
+            result = request_seen_rx => result.unwrap(),
+            output = &mut first_output => panic!(
+                "prefill handoff arrived before the backend saw the request: {output:?}"
+            ),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut first_output)
+                .await
+                .is_err(),
+            "sending the request alone must not release the prefill handoff"
+        );
+
+        release_headers_tx.send(()).unwrap();
+        let handoff = tokio::time::timeout(Duration::from_secs(1), first_output)
+            .await
+            .expect("handoff did not arrive after successful response headers")
+            .unwrap()
+            .unwrap();
+        assert_eq!(handoff.disaggregated_params.unwrap()["bootstrap_room"], 7);
+
+        release_body_tx.send(()).unwrap();
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert_eq!(terminal.finish_reason, Some(FinishReason::Stop));
+        assert!(terminal.disaggregated_params.is_none());
         assert!(stream.next().await.is_none());
         server.await.unwrap();
     }

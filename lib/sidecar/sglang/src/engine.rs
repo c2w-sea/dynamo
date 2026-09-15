@@ -318,9 +318,9 @@ impl LLMEngine for SglangSidecarEngine {
                     ));
                     return;
                 };
-                // Publish the handoff only after SGLang accepts the prefill RPC.
-                // Decode can then rendezvous while this stream is drained without
-                // racing a bootstrap room that the backend has not seen yet.
+                // Publish the handoff only after the gRPC transport opens the
+                // response stream. Decode can then rendezvous while the remaining
+                // prefill response is supervised in the background.
                 yield Ok(LLMEngineOutput {
                     disaggregated_params: Some(handoff),
                     ..Default::default()
@@ -938,6 +938,12 @@ fn build_engine_config(
         "grpc_service".to_string(),
         Value::String("sglang.runtime.v1.SglangService".to_string()),
     );
+    if mode.is_prefill() {
+        runtime_data.insert(
+            "prefill_handoff_after_transport_acceptance".to_string(),
+            Value::Bool(true),
+        );
+    }
     if let Some(total_tokens) =
         hicache_native_offloading_capacity(&discovery.server_info, &discovery.model_info)
     {
@@ -1038,6 +1044,36 @@ mod tests {
         )
         .unwrap();
         assert!(!plain.llm.unwrap().enable_eagle);
+    }
+
+    #[test]
+    fn prefill_registration_requires_transport_acceptance_before_handoff() {
+        let prefill = build_engine_config(
+            &discovery(json!({})),
+            DisaggregationMode::Prefill,
+            Some("prefill".to_string()),
+            Some(5000),
+        )
+        .unwrap();
+        assert_eq!(
+            prefill
+                .runtime_data
+                .get("prefill_handoff_after_transport_acceptance"),
+            Some(&json!(true))
+        );
+
+        let aggregated = build_engine_config(
+            &discovery(json!({})),
+            DisaggregationMode::Aggregated,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !aggregated
+                .runtime_data
+                .contains_key("prefill_handoff_after_transport_acceptance")
+        );
     }
 
     #[test]

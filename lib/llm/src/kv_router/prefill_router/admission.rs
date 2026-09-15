@@ -11,7 +11,7 @@ use tracing::Instrument;
 use dynamo_kv_router::selector::WorkerSelector;
 
 use dynamo_runtime::{
-    pipeline::ManyOut,
+    pipeline::{AsyncEngineContextProvider, ManyOut, ResponseStream},
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
 
@@ -47,10 +47,6 @@ where
             return Err(PrefillError::PrefillError(detail, Some(Box::new(error))));
         }
 
-        if let Some(ref tracker) = tracker {
-            tracker.record_prefill_complete();
-        }
-
         let mut prompt_tokens_details = first_output
             .data
             .as_ref()
@@ -70,6 +66,9 @@ where
             });
 
         if !is_bootstrap {
+            if let Some(ref tracker) = tracker {
+                tracker.record_prefill_complete();
+            }
             while let Some(next) = prefill_response.next().await {
                 if let Some(error) = next.err() {
                     let detail = format!("Prefill router returned error in output stream: {error}");
@@ -85,9 +84,25 @@ where
                 }
             }
         } else {
-            tokio::spawn(async move {
-                let _task_guard = task_guard;
-                while prefill_response.next().await.is_some() {}
+            let monitor = Self::spawn_prefill_monitor(prefill_response, tracker, task_guard);
+
+            let Some(output) = &first_output.data else {
+                return Err(PrefillError::NoDisaggregatedParams(
+                    "Prefill router output has no data field".to_string(),
+                ));
+            };
+            let Some(disaggregated_params) = output.disaggregated_params.clone() else {
+                return Err(PrefillError::NoDisaggregatedParams(
+                    "Prefill router output missing disaggregated_params".to_string(),
+                ));
+            };
+            return Ok(PrefillCompletion::Handoff {
+                result: crate::protocols::common::preprocessor::PrefillResult {
+                    disaggregated_params,
+                    prompt_tokens_details,
+                },
+                worker_link: output.worker_trace_link.clone(),
+                monitor,
             });
         }
 
@@ -144,7 +159,123 @@ where
                 prompt_tokens_details,
             },
             worker_link: output.worker_trace_link.clone(),
+            monitor: Self::completed_prefill_monitor(),
         })
+    }
+
+    fn completed_prefill_monitor() -> super::PrefillMonitor {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Ok(()));
+        rx
+    }
+
+    async fn drain_prefill_stream(
+        mut prefill_response: ManyOut<Annotated<LLMEngineOutput>>,
+        tracker: Option<Arc<RequestTracker>>,
+        task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
+    ) -> Result<(), PrefillError> {
+        let _task_guard = task_guard;
+        let mut recorded_prefill = false;
+        while let Some(next) = prefill_response.next().await {
+            if let Some(error) = next.err() {
+                let detail = format!("Prefill failed after decode handoff: {error}");
+                return Err(PrefillError::PrefillError(detail, Some(Box::new(error))));
+            }
+            if !recorded_prefill {
+                if let Some(ref tracker) = tracker {
+                    tracker.record_prefill_complete();
+                }
+                recorded_prefill = true;
+            }
+            let Some(finish_reason) = next
+                .data
+                .as_ref()
+                .and_then(|output| output.finish_reason.as_ref())
+            else {
+                continue;
+            };
+            match finish_reason {
+                FinishReason::Error(message) => {
+                    return Err(PrefillError::PrefillError(
+                        format!("Prefill failed after decode handoff: {message}"),
+                        None,
+                    ));
+                }
+                FinishReason::Cancelled => {
+                    return Err(PrefillError::PrefillError(
+                        "Prefill was cancelled after decode handoff".to_string(),
+                        None,
+                    ));
+                }
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn_prefill_monitor(
+        prefill_stream: ManyOut<Annotated<LLMEngineOutput>>,
+        tracker: Option<Arc<RequestTracker>>,
+        task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
+    ) -> super::PrefillMonitor {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let result = Self::drain_prefill_stream(prefill_stream, tracker, task_guard).await;
+                if result_tx.send(result).is_err() {
+                    tracing::debug!(
+                        "Decode completed before the prefill monitor result was observed"
+                    );
+                }
+            }
+            .instrument(span),
+        );
+        result_rx
+    }
+
+    pub(super) fn supervise_decode_stream(
+        mut decode_stream: ManyOut<Annotated<LLMEngineOutput>>,
+        mut prefill_monitor: super::PrefillMonitor,
+    ) -> ManyOut<Annotated<LLMEngineOutput>> {
+        let decode_context = decode_stream.context();
+        let response_context = decode_context.clone();
+        ResponseStream::new(
+            Box::pin(async_stream::stream! {
+                let mut prefill_finished = false;
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut prefill_monitor, if !prefill_finished => {
+                            match result {
+                                Ok(Ok(())) => {
+                                    prefill_finished = true;
+                                }
+                                Ok(Err(error)) => {
+                                    decode_context.stop_generating();
+                                    yield Annotated::from_err(error);
+                                    return;
+                                }
+                                Err(error) => {
+                                    decode_context.stop_generating();
+                                    yield Annotated::from_error(format!(
+                                        "Prefill supervision task stopped unexpectedly: {error}"
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                        output = decode_stream.next() => {
+                            let Some(output) = output else {
+                                return;
+                            };
+                            yield output;
+                        }
+                    }
+                }
+            }),
+            response_context,
+        )
     }
 
     pub(super) fn spawn_prefill_task(
@@ -152,19 +283,10 @@ where
         prefill_stream: ManyOut<Annotated<LLMEngineOutput>>,
         tracker: Option<Arc<RequestTracker>>,
         phase_transition_permit: OwnedSemaphorePermit,
-    ) {
-        let span = tracing::Span::current();
+    ) -> super::PrefillMonitor {
         let task_guard = self.task_guard.clone();
-        tokio::spawn(
-            async move {
-                drop(phase_transition_permit);
-                match Self::consume_prefill_stream(prefill_stream, tracker, task_guard).await {
-                    Ok(_) => tracing::debug!("Prefill background task completed"),
-                    Err(error) => tracing::warn!("Prefill background task error: {error:?}"),
-                }
-            }
-            .instrument(span),
-        );
+        drop(phase_transition_permit);
+        Self::spawn_prefill_monitor(prefill_stream, tracker, task_guard)
     }
 }
 
@@ -174,7 +296,7 @@ mod tests {
     use futures::stream;
     use serde_json::json;
 
-    use dynamo_runtime::pipeline::{ResponseStream, context::Controller};
+    use dynamo_runtime::pipeline::{AsyncEngineContext, ResponseStream, context::Controller};
 
     use super::*;
 
@@ -233,6 +355,61 @@ mod tests {
         })
         .await
         .expect("bootstrap drain did not release its teardown guard");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_monitor_reports_errors_after_handoff() {
+        let first = Annotated::from_data(LLMEngineOutput {
+            disaggregated_params: Some(json!({
+                "bootstrap_host": "127.0.0.1",
+                "bootstrap_port": 1,
+                "bootstrap_room": "test",
+            })),
+            ..Default::default()
+        });
+        let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
+            prefill_stream(vec![
+                first,
+                Annotated::from_error("prefill transfer failed"),
+            ]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let PrefillCompletion::Handoff { monitor, .. } = result else {
+            panic!("expected prefill handoff");
+        };
+
+        let error = monitor.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("prefill transfer failed"));
+    }
+
+    #[tokio::test]
+    async fn prefill_monitor_error_stops_decode_and_reaches_client() {
+        let controller = Arc::new(Controller::default());
+        let decode = ResponseStream::new(Box::pin(stream::pending()), controller.clone());
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        result_tx
+            .send(Err(PrefillError::PrefillError(
+                "transfer failed".to_string(),
+                None,
+            )))
+            .unwrap();
+
+        let mut supervised =
+            PrefillRouter::<DefaultWorkerSelector>::supervise_decode_stream(decode, result_rx);
+        let output = supervised.next().await.unwrap();
+
+        assert!(
+            output
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("transfer failed")
+        );
+        assert!(controller.is_stopped());
+        assert!(supervised.next().await.is_none());
     }
 
     #[tokio::test]
